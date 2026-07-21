@@ -73,7 +73,7 @@ EnvironmentFile=/etc/upguard-agent/agent.env
 ExecStart=$BIN_PATH
 Restart=always
 RestartSec=10
-DynamicUser=yes
+# Roda como root para enxergar serviços do sistema (systemctl) e todos os discos.
 
 [Install]
 WantedBy=multi-user.target
