@@ -75,7 +75,8 @@ DynamicUser=yes
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now upguard-agent
+  systemctl enable upguard-agent >/dev/null 2>&1 || true
+  systemctl restart upguard-agent   # restart (não só start) para pegar binário novo em updates
   echo "OK — serviço systemd 'upguard-agent' ativo. Logs: journalctl -u upguard-agent -f"
 else
   # macOS: launchd
