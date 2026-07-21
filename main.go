@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
 	psnet "github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 var version = "dev"
@@ -40,18 +42,27 @@ type sw struct {
 	Version string `json:"version"`
 }
 
+type procInfo struct {
+	PID  int32   `json:"pid"`
+	Name string  `json:"name"`
+	CPU  float64 `json:"cpu_percent"`
+	Mem  float64 `json:"mem_percent"`
+}
+
 type hostInfo struct {
-	Hostname        string `json:"hostname"`
-	OS              string `json:"os"`
-	Platform        string `json:"platform"`
-	Kernel          string `json:"kernel"`
-	AgentVersion    string `json:"agent_version"`
-	CPUCores        int    `json:"cpu_cores"`
-	MemTotal        uint64 `json:"mem_total_bytes"`
-	IPAddress       string `json:"ip_address"`
-	Processes       uint64 `json:"processes"`
-	ServicesRunning int    `json:"services_running"`
-	Software        []sw   `json:"software"`
+	Hostname        string     `json:"hostname"`
+	OS              string     `json:"os"`
+	Platform        string     `json:"platform"`
+	Kernel          string     `json:"kernel"`
+	AgentVersion    string     `json:"agent_version"`
+	CPUCores        int        `json:"cpu_cores"`
+	MemTotal        uint64     `json:"mem_total_bytes"`
+	IPAddress       string     `json:"ip_address"`
+	Processes       uint64     `json:"processes"`
+	ServicesRunning int        `json:"services_running"`
+	ServicesList    []string   `json:"services_list"`
+	TopProcesses    []procInfo `json:"top_processes"`
+	Software        []sw       `json:"software"`
 }
 
 type metrics struct {
@@ -142,22 +153,62 @@ func primaryIP() string {
 	return ""
 }
 
-// runningServices conta serviços systemd ativos (Linux). Em outros SOs, 0.
-func runningServices() int {
+// runningServices lista os serviços systemd ativos (Linux). Em outros SOs, nil.
+func runningServices() []string {
 	if runtime.GOOS != "linux" {
-		return 0
+		return nil
 	}
 	out, err := exec.Command("systemctl", "list-units", "--type=service", "--state=running", "--no-legend", "--no-pager", "--plain").Output()
 	if err != nil {
-		return 0
+		return nil
 	}
-	n := 0
+	var svcs []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if strings.TrimSpace(line) != "" {
-			n++
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		svcs = append(svcs, strings.TrimSuffix(fields[0], ".service"))
 	}
-	return n
+	sort.Strings(svcs)
+	return svcs
+}
+
+// topProcesses lista os processos que mais consomem CPU (com memória), até limit.
+func topProcesses(limit int) []procInfo {
+	procs, err := process.Processes()
+	if err != nil {
+		return nil
+	}
+	out := make([]procInfo, 0, len(procs))
+	for _, pr := range procs {
+		name, err := pr.Name()
+		if err != nil || name == "" {
+			continue
+		}
+		cpuPct, _ := pr.CPUPercent()
+		memPct, _ := pr.MemoryPercent()
+		out = append(out, procInfo{
+			PID:  pr.Pid,
+			Name: name,
+			CPU:  round2(cpuPct),
+			Mem:  round2(float64(memPct)),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CPU != out[j].CPU {
+			return out[i].CPU > out[j].CPU
+		}
+		return out[i].Mem > out[j].Mem
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
 
 func round2(f float64) float64 { return float64(int64(f*100+0.5)) / 100 }
@@ -284,7 +335,10 @@ func collect(cfg config, client *http.Client) payload {
 		p.Host.Hostname, _ = os.Hostname()
 	}
 	p.Host.IPAddress = primaryIP()
-	p.Host.ServicesRunning = runningServices()
+	svcs := runningServices()
+	p.Host.ServicesList = svcs
+	p.Host.ServicesRunning = len(svcs)
+	p.Host.TopProcesses = topProcesses(50)
 
 	if c, err := cpu.Counts(true); err == nil {
 		p.Host.CPUCores = c
