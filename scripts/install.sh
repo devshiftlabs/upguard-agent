@@ -44,8 +44,12 @@ BIN_URL="$BASE_URL/upguard-agent-${OS}-${ARCH}"
 BIN_PATH="/usr/local/bin/upguard-agent"
 
 echo "Baixando $BIN_URL ..."
-curl -fsSL "$BIN_URL" -o "$BIN_PATH"
-chmod +x "$BIN_PATH"
+# Baixa para um temp e move (rename atômico) — evita "Text file busy" (ETXTBSY)
+# quando o binário já está em execução (update do agente).
+TMP_BIN="$(mktemp)"
+curl -fsSL "$BIN_URL" -o "$TMP_BIN"
+chmod +x "$TMP_BIN"
+mv -f "$TMP_BIN" "$BIN_PATH"
 
 # Config em /etc/upguard-agent/agent.env
 mkdir -p /etc/upguard-agent
