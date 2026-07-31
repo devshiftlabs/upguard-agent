@@ -16,12 +16,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -81,14 +83,21 @@ type metrics struct {
 
 type payload struct {
 	Host    hostInfo `json:"host"`
-	Metrics metrics  `json:"metrics"`
+	Metrics *metrics `json:"metrics,omitempty"` // omitido quando o agente está pausado
 }
 
 type ingestResponse struct {
 	Config struct {
-		IntervalSeconds int `json:"interval_seconds"`
+		IntervalSeconds int  `json:"interval_seconds"`
+		Paused          bool `json:"paused"`
+		UpdateRequested bool `json:"update_requested"`
 	} `json:"config"`
 }
+
+const (
+	ghLatestAPI    = "https://api.github.com/repos/devshiftlabs/upguard-agent/releases/latest"
+	releaseBinBase = "https://github.com/devshiftlabs/upguard-agent/releases/latest/download"
+)
 
 type config struct {
 	clientID, clientSecret, server, hostname string
@@ -314,19 +323,20 @@ func softwareInventory(cfg config, client *http.Client) []sw {
 }
 
 // collect coleta uma amostra. Erros por métrica são tolerados (campo fica zero).
-func collect(cfg config, client *http.Client) payload {
+func collect(cfg config, client *http.Client, paused bool) payload {
 	hostnameOverride := cfg.hostname
 	p := payload{}
 	p.Host.AgentVersion = version
 	p.Host.OS = runtime.GOOS
 	p.Host.Software = softwareInventory(cfg, client)
 
+	var uptime uint64
 	if hi, err := host.Info(); err == nil {
 		p.Host.Hostname = hi.Hostname
 		p.Host.Platform = strings.TrimSpace(fmt.Sprintf("%s %s", hi.Platform, hi.PlatformVersion))
 		p.Host.Kernel = hi.KernelVersion
 		p.Host.Processes = hi.Procs
-		p.Metrics.Uptime = hi.Uptime
+		uptime = hi.Uptime
 	}
 	if hostnameOverride != "" {
 		p.Host.Hostname = hostnameOverride
@@ -343,42 +353,63 @@ func collect(cfg config, client *http.Client) payload {
 	if c, err := cpu.Counts(true); err == nil {
 		p.Host.CPUCores = c
 	}
-	if pct, err := cpu.Percent(time.Second, false); err == nil && len(pct) > 0 {
-		p.Metrics.CPUPercent = round2(pct[0])
-	}
+	var memUsedPct float64
+	var memUsed uint64
+	haveMem := false
 	if vm, err := mem.VirtualMemory(); err == nil {
 		p.Host.MemTotal = vm.Total
-		p.Metrics.MemPercent = round2(vm.UsedPercent)
-		p.Metrics.MemUsed = vm.Used
+		memUsedPct, memUsed, haveMem = vm.UsedPercent, vm.Used, true
+	}
+
+	// Pausado: envia apenas info do host (heartbeat), sem coletar métricas.
+	// O campo metrics é omitido, então o servidor não grava amostra nem avalia alertas.
+	if paused {
+		return p
+	}
+
+	m := metrics{Uptime: uptime}
+	if pct, err := cpu.Percent(time.Second, false); err == nil && len(pct) > 0 {
+		m.CPUPercent = round2(pct[0])
+	}
+	if haveMem {
+		m.MemPercent = round2(memUsedPct)
+		m.MemUsed = memUsed
 	}
 	if du, err := disk.Usage(rootPath()); err == nil {
-		p.Metrics.DiskPercent = round2(du.UsedPercent)
-		p.Metrics.DiskUsed = du.Used
+		m.DiskPercent = round2(du.UsedPercent)
+		m.DiskUsed = du.Used
 	}
 	if la, err := load.Avg(); err == nil {
-		p.Metrics.Load1 = round2(la.Load1)
-		p.Metrics.Load5 = round2(la.Load5)
-		p.Metrics.Load15 = round2(la.Load15)
+		m.Load1 = round2(la.Load1)
+		m.Load5 = round2(la.Load5)
+		m.Load15 = round2(la.Load15)
 	}
 	if io, err := psnet.IOCounters(false); err == nil && len(io) > 0 {
-		p.Metrics.NetRx = io[0].BytesRecv
-		p.Metrics.NetTx = io[0].BytesSent
+		m.NetRx = io[0].BytesRecv
+		m.NetTx = io[0].BytesSent
 	}
+	p.Metrics = &m
 	return p
 }
 
 // send envia a amostra e retorna o intervalo desejado pelo servidor (0 se n/d).
-func send(cfg config, client *http.Client, p payload) (int, error) {
+type serverConfig struct {
+	interval        int
+	paused          bool
+	updateRequested bool
+}
+
+func send(cfg config, client *http.Client, p payload) (serverConfig, error) {
 	body, err := json.Marshal(p)
 	if err != nil {
-		return 0, err
+		return serverConfig{}, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.server+"/api/agent/metrics", bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return serverConfig{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "upguard-agent/"+version)
@@ -386,15 +417,164 @@ func send(cfg config, client *http.Client, p payload) (int, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return serverConfig{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("servidor respondeu %d", resp.StatusCode)
+		return serverConfig{}, fmt.Errorf("servidor respondeu %d", resp.StatusCode)
 	}
 	var out ingestResponse
 	_ = json.NewDecoder(resp.Body).Decode(&out)
-	return out.Config.IntervalSeconds, nil
+	return serverConfig{out.Config.IntervalSeconds, out.Config.Paused, out.Config.UpdateRequested}, nil
+}
+
+// latestVersion consulta a API do GitHub pela última release (tag sem "v").
+func latestVersion(client *http.Client) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ghLatestAPI, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "upguard-agent/"+version)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("github respondeu %d", resp.StatusCode)
+	}
+	var out struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(out.TagName, "v"), nil
+}
+
+func parseVer(s string) [3]int {
+	var v [3]int
+	for i, part := range strings.SplitN(s, ".", 3) {
+		if i >= 3 {
+			break
+		}
+		n := 0
+		_, _ = fmt.Sscanf(part, "%d", &n)
+		v[i] = n
+	}
+	return v
+}
+
+// versionLess informa se a < b para versões "x.y.z".
+func versionLess(a, b string) bool {
+	pa, pb := parseVer(a), parseVer(b)
+	for i := 0; i < 3; i++ {
+		if pa[i] != pb[i] {
+			return pa[i] < pb[i]
+		}
+	}
+	return false
+}
+
+// selfUpdate baixa o binário mais novo da última release e re-executa o processo.
+// O rename atômico sobre o binário em execução é permitido no Linux/macOS (o
+// processo atual mantém o inode antigo); no Windows o serviço reinicia sozinho.
+func selfUpdate(client *http.Client) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	url := releaseBinBase + "/upguard-agent-" + runtime.GOOS + "-" + runtime.GOARCH + ext
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "upguard-agent/"+version)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("download respondeu %d", resp.StatusCode)
+	}
+	tmp := exe + ".new"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, exe); err != nil {
+		return err
+	}
+	log.Printf("binário atualizado — reexecutando %s", exe)
+	if runtime.GOOS == "windows" {
+		os.Exit(0) // o gerenciador de serviço reinicia com o novo binário
+	}
+	return syscall.Exec(exe, os.Args, os.Environ())
+}
+
+// maybeUpdate atualiza o agente se o portal forçou (force) ou se há versão nova.
+func maybeUpdate(client *http.Client, force bool) {
+	if !force {
+		latest, err := latestVersion(client)
+		if err != nil || !versionLess(version, latest) {
+			return
+		}
+		log.Printf("nova versão disponível: %s (atual %s) — atualizando", latest, version)
+	} else {
+		log.Printf("atualização forçada pelo portal — atualizando")
+	}
+	if err := selfUpdate(client); err != nil {
+		log.Printf("falha ao auto-atualizar: %v", err)
+	}
+}
+
+type loopState struct {
+	current time.Duration
+	paused  bool
+}
+
+// apply processa a config server-driven: update forçado, pausa e intervalo.
+func (st *loopState) apply(client *http.Client, sc serverConfig) {
+	if sc.updateRequested {
+		maybeUpdate(client, true) // força; re-executa e não retorna
+	}
+	if sc.paused != st.paused {
+		log.Printf("estado alterado pelo portal: paused=%v", sc.paused)
+		st.paused = sc.paused
+	}
+	if sc.interval >= 10 {
+		want := time.Duration(sc.interval) * time.Second
+		if want != st.current {
+			log.Printf("intervalo ajustado pelo portal: %s -> %s", st.current, want)
+			st.current = want
+		}
+	}
+}
+
+func logSent(p payload) {
+	if p.Metrics != nil {
+		log.Printf("métricas enviadas: cpu=%.1f%% mem=%.1f%% disk=%.1f%% svc=%d",
+			p.Metrics.CPUPercent, p.Metrics.MemPercent, p.Metrics.DiskPercent, p.Host.ServicesRunning)
+	} else {
+		log.Printf("pausado — heartbeat enviado (sem métricas)")
+	}
 }
 
 func main() {
@@ -405,27 +585,30 @@ func main() {
 
 	log.Printf("upguard-agent %s iniciando — servidor=%s intervalo(inicial)=%s", version, cfg.server, cfg.interval)
 	client := &http.Client{Timeout: 20 * time.Second}
-	current := cfg.interval
+	st := &loopState{current: cfg.interval}
+	var lastUpdateCheck time.Time
 
 	timer := time.NewTimer(0) // dispara imediatamente no início
 	defer timer.Stop()
 	for range timer.C {
-		p := collect(cfg, client)
-		serverInterval, err := send(cfg, client, p)
-		if err != nil {
+		// Auto-update periódico (a cada 6h; também no primeiro ciclo). Se houver
+		// versão nova, selfUpdate re-executa o processo e não retorna.
+		if time.Since(lastUpdateCheck) > 6*time.Hour {
+			lastUpdateCheck = time.Now()
+			maybeUpdate(client, false)
+		}
+		p := collect(cfg, client, st.paused)
+		if sc, err := send(cfg, client, p); err != nil {
 			log.Printf("erro ao enviar métricas: %v", err)
 		} else {
-			log.Printf("métricas enviadas: cpu=%.1f%% mem=%.1f%% disk=%.1f%% svc=%d",
-				p.Metrics.CPUPercent, p.Metrics.MemPercent, p.Metrics.DiskPercent, p.Host.ServicesRunning)
-			// Intervalo server-driven: ajusta se o portal mudou.
-			if serverInterval >= 10 {
-				want := time.Duration(serverInterval) * time.Second
-				if want != current {
-					log.Printf("intervalo ajustado pelo portal: %s -> %s", current, want)
-					current = want
-				}
-			}
+			logSent(p)
+			st.apply(client, sc)
 		}
-		timer.Reset(current)
+		// Pausado: verifica o portal com mais frequência (para retomar rápido).
+		next := st.current
+		if st.paused && next > 30*time.Second {
+			next = 30 * time.Second
+		}
+		timer.Reset(next)
 	}
 }
