@@ -398,6 +398,7 @@ func collect(cfg config, client *http.Client, paused bool) payload {
 
 // send envia a amostra e retorna o intervalo desejado pelo servidor (0 se n/d).
 type serverConfig struct {
+	hostID          string
 	interval        int
 	paused          bool
 	updateRequested bool
@@ -429,7 +430,7 @@ func send(cfg config, client *http.Client, p payload) (serverConfig, error) {
 	}
 	var out ingestResponse
 	_ = json.NewDecoder(resp.Body).Decode(&out)
-	return serverConfig{out.Config.IntervalSeconds, out.Config.Paused, out.Config.UpdateRequested}, nil
+	return serverConfig{out.HostID, out.Config.IntervalSeconds, out.Config.Paused, out.Config.UpdateRequested}, nil
 }
 
 // latestVersion consulta a API do GitHub pela última release (tag sem "v").
@@ -591,6 +592,8 @@ func main() {
 	client := &http.Client{Timeout: 20 * time.Second}
 	st := &loopState{current: cfg.interval}
 	var lastUpdateCheck time.Time
+	var hostID string
+	runner := newCheckRunner()
 
 	timer := time.NewTimer(0) // dispara imediatamente no início
 	defer timer.Stop()
@@ -606,7 +609,14 @@ func main() {
 			log.Printf("erro ao enviar métricas: %v", err)
 		} else {
 			logSent(p)
+			if sc.hostID != "" {
+				hostID = sc.hostID
+			}
 			st.apply(client, sc)
+			// Checks privados (bancos na rede local) — não roda pausado.
+			if !st.paused {
+				runner.cycle(cfg, client, hostID)
+			}
 		}
 		// Pausado: verifica o portal com mais frequência (para retomar rápido).
 		next := st.current
