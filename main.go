@@ -87,12 +87,16 @@ type payload struct {
 }
 
 type ingestResponse struct {
+	HostID string `json:"host_id"`
 	Config struct {
 		IntervalSeconds int  `json:"interval_seconds"`
 		Paused          bool `json:"paused"`
 		UpdateRequested bool `json:"update_requested"`
 	} `json:"config"`
 }
+
+// userAgent é resolvido em runtime (version vem de -ldflags no build).
+var userAgent = "upguard-agent/" + version
 
 const (
 	ghLatestAPI    = "https://api.github.com/repos/devshiftlabs/upguard-agent/releases/latest"
@@ -412,7 +416,7 @@ func send(cfg config, client *http.Client, p payload) (serverConfig, error) {
 		return serverConfig{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "upguard-agent/"+version)
+	req.Header.Set("User-Agent", userAgent)
 	req.SetBasicAuth(cfg.clientID, cfg.clientSecret)
 
 	resp, err := client.Do(req)
@@ -437,7 +441,7 @@ func latestVersion(client *http.Client) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "upguard-agent/"+version)
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -498,7 +502,7 @@ func selfUpdate(client *http.Client) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "upguard-agent/"+version)
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
