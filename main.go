@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
@@ -166,11 +167,21 @@ func primaryIP() string {
 	return ""
 }
 
-// runningServices lista os serviços systemd ativos (Linux). Em outros SOs, nil.
+// runningServices lista os serviços do host. systemd no Linux, rc.d no
+// FreeBSD/pfSense; em outros SOs, nil.
 func runningServices() []string {
-	if runtime.GOOS != "linux" {
+	switch runtime.GOOS {
+	case "linux":
+		return systemdServices()
+	case "freebsd":
+		return rcServices()
+	default:
 		return nil
 	}
+}
+
+// systemdServices lista os serviços systemd ativos (Linux).
+func systemdServices() []string {
 	out, err := exec.Command("systemctl", "list-units", "--type=service", "--state=running", "--no-legend", "--no-pager", "--plain").Output()
 	if err != nil {
 		return nil
@@ -186,6 +197,25 @@ func runningServices() []string {
 			continue
 		}
 		svcs = append(svcs, strings.TrimSuffix(fields[0], ".service"))
+	}
+	sort.Strings(svcs)
+	return svcs
+}
+
+// rcServices lista os serviços rc.d habilitados (FreeBSD/pfSense). `service -e`
+// devolve o caminho de cada script habilitado; reduzimos ao nome-base.
+func rcServices() []string {
+	out, err := exec.Command("service", "-e").Output()
+	if err != nil {
+		return nil
+	}
+	var svcs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		svcs = append(svcs, strings.TrimSuffix(filepath.Base(line), ".sh"))
 	}
 	sort.Strings(svcs)
 	return svcs

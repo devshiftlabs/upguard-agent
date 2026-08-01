@@ -1,8 +1,11 @@
-#!/usr/bin/env bash
-# Instalador do UpGuard Agent para Linux e macOS.
+#!/bin/sh
+# Instalador do UpGuard Agent para Linux, macOS e FreeBSD/pfSense.
+# POSIX sh (sem bashismos) — roda em bash, dash e no /bin/sh do FreeBSD/pfSense.
 # Uso:
-#   curl -sSL https://.../install.sh | sudo bash -s -- \
+#   curl -sSL https://.../install.sh | sudo sh -s -- \
 #        --client-id agt_xxx --client-secret sk_agt_xxx
+#   # No pfSense (já é root, e pode não ter curl): fetch -o- https://.../install.sh | \
+#   #   sh -s -- --client-id agt_xxx --client-secret sk_agt_xxx
 #
 # Flags:
 #   --client-id       (obrigatório)
@@ -10,7 +13,7 @@
 #   --server URL      (default https://api.upguard.com.br)
 #   --interval SEG    (default 60)
 #   --base-url URL    (onde baixar o binário; default releases do GitHub)
-set -euo pipefail
+set -eu
 
 CLIENT_ID=""
 CLIENT_SECRET=""
@@ -32,7 +35,7 @@ done
 [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ] || { echo "erro: --client-id e --client-secret são obrigatórios"; exit 1; }
 [ "$(id -u)" = "0" ] || { echo "erro: rode como root (sudo)"; exit 1; }
 
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"   # linux | darwin
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"   # linux | darwin | freebsd
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64|amd64) ARCH="amd64";;
@@ -43,11 +46,22 @@ esac
 BIN_URL="$BASE_URL/upguard-agent-${OS}-${ARCH}"
 BIN_PATH="/usr/local/bin/upguard-agent"
 
+# download URL -> arquivo. Usa curl se existir, senão fetch (padrão no FreeBSD).
+download() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1" -o "$2"
+  elif command -v fetch >/dev/null 2>&1; then
+    fetch -q -o "$2" "$1"
+  else
+    echo "erro: nem curl nem fetch disponíveis para baixar o binário"; exit 1
+  fi
+}
+
 echo "Baixando $BIN_URL ..."
 # Baixa para um temp e move (rename atômico) — evita "Text file busy" (ETXTBSY)
 # quando o binário já está em execução (update do agente).
 TMP_BIN="$(mktemp)"
-curl -fsSL "$BIN_URL" -o "$TMP_BIN"
+download "$BIN_URL" "$TMP_BIN"
 chmod +x "$TMP_BIN"
 mv -f "$TMP_BIN" "$BIN_PATH"
 
@@ -61,7 +75,8 @@ UPGUARD_INTERVAL=$INTERVAL
 EOF
 chmod 600 /etc/upguard-agent/agent.env
 
-if [ "$OS" = "linux" ]; then
+case "$OS" in
+linux)
   cat > /etc/systemd/system/upguard-agent.service <<EOF
 [Unit]
 Description=UpGuard Monitoring Agent
@@ -82,7 +97,9 @@ EOF
   systemctl enable upguard-agent >/dev/null 2>&1 || true
   systemctl restart upguard-agent   # restart (não só start) para pegar binário novo em updates
   echo "OK — serviço systemd 'upguard-agent' ativo. Logs: journalctl -u upguard-agent -f"
-else
+  ;;
+
+darwin)
   # macOS: launchd
   PLIST=/Library/LaunchDaemons/br.com.shiftlabs.upguard-agent.plist
   cat > "$PLIST" <<EOF
@@ -104,4 +121,66 @@ EOF
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load -w "$PLIST"
   echo "OK — LaunchDaemon 'upguard-agent' carregado."
-fi
+  ;;
+
+freebsd)
+  # FreeBSD/pfSense: serviço rc.d supervisionado por daemon(8) (reinício em falha).
+  # O pfSense só executa no boot scripts rc.d terminados em ".sh"; no FreeBSD puro
+  # o nome sem sufixo é o convencional. Detectamos o pfSense pelo ident do kernel.
+  RC_NAME="upguard_agent"
+  RC_FILE="/usr/local/etc/rc.d/${RC_NAME}"
+  if [ "$(uname -i 2>/dev/null || true)" = "pfSense" ] || [ -f /usr/local/sbin/pfSsh.php ]; then
+    RC_FILE="/usr/local/etc/rc.d/${RC_NAME}.sh"
+  fi
+  mkdir -p /usr/local/etc/rc.d
+  cat > "$RC_FILE" <<EOF
+#!/bin/sh
+#
+# PROVIDE: ${RC_NAME}
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# UpGuard Monitoring Agent — serviço rc.d (FreeBSD / pfSense).
+
+. /etc/rc.subr
+
+name="${RC_NAME}"
+rcvar="${RC_NAME}_enable"
+
+# pidfile = PID do supervisor daemon(8); o rc.subr para o serviço matando-o (o
+# supervisor então encerra o agente e NÃO o reinicia).
+pidfile="/var/run/\${name}.pid"
+command="/usr/sbin/daemon"
+agent_bin="${BIN_PATH}"
+# -r reinicia o agente se ele cair; -S envia stdout/stderr ao syslog (tag=name);
+# -P grava o PID do supervisor; -p grava o PID do agente.
+command_args="-r -S -T \${name} -P \${pidfile} -p /var/run/\${name}_child.pid \${agent_bin}"
+
+start_precmd="${RC_NAME}_precmd"
+${RC_NAME}_precmd()
+{
+	# Exporta as credenciais/config para o processo do agente.
+	if [ -r /etc/upguard-agent/agent.env ]; then
+		set -a
+		. /etc/upguard-agent/agent.env
+		set +a
+	fi
+}
+
+load_rc_config "\$name"
+: \${${RC_NAME}_enable:="YES"}
+# O pfSense executa scripts *.sh no boot sem passar argumento — assume "start".
+run_rc_command "\${1:-start}"
+EOF
+  chmod +x "$RC_FILE"
+  # Habilita no rc.conf (no-op no pfSense, mas correto no FreeBSD puro).
+  sysrc "${RC_NAME}_enable=YES" >/dev/null 2>&1 || true
+  # restart (não só start) para pegar binário novo em reinstalações/updates.
+  service "$RC_NAME" restart 2>/dev/null || service "$RC_NAME" start
+  echo "OK — serviço rc.d '${RC_NAME}' ativo ($RC_FILE). Logs: tail -f /var/log/messages | grep ${RC_NAME}"
+  ;;
+
+*)
+  echo "erro: SO não suportado: $OS"; exit 1
+  ;;
+esac

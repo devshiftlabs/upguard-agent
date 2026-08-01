@@ -11,7 +11,7 @@ DOCKER="${DOCKER:-docker}"
   set -e
   apk add --no-cache git >/dev/null
   go mod tidy
-  for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+  for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 freebsd/amd64 freebsd/arm64; do
     os=\${target%/*}; arch=\${target#*/}
     ext=''; [ \"\$os\" = windows ] && ext='.exe'
     echo \"building \$os/\$arch\"

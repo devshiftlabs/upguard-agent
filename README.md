@@ -4,9 +4,9 @@ Agente de monitoramento local (binário único, Go) que coleta métricas de
 sistema — CPU, memória, disco, load, rede, uptime — e as envia para a sua conta
 UpGuard, autenticado por **client-id / client-secret**.
 
-- **Cross-platform**: Linux, macOS e Windows (amd64 + arm64).
+- **Cross-platform**: Linux, macOS, Windows e FreeBSD/pfSense (amd64 + arm64).
 - **Sem dependências** de runtime no host (binário estático).
-- Roda como **serviço** (systemd / launchd / Windows Service) e reinicia no boot.
+- Roda como **serviço** (systemd / launchd / Windows Service / rc.d) e reinicia no boot.
 
 ## Instalação
 
@@ -24,6 +24,20 @@ curl -sSL https://.../install.sh | sudo bash -s -- \
 iwr -useb https://.../install.ps1 | iex; `
   Install-UpGuardAgent -ClientId agt_xxx -ClientSecret sk_agt_xxx
 ```
+
+### FreeBSD / pfSense (como root, shell)
+O pfSense não traz `bash` — use `sh`. Se `curl` não existir, o instalador cai
+para o `fetch` nativo:
+```sh
+fetch -o- https://.../install.sh | sh -s -- \
+  --client-id agt_xxx --client-secret sk_agt_xxx
+```
+Instala um serviço **rc.d** (`upguard_agent`) supervisionado por `daemon(8)`
+(reinicia em falha, inicia no boot). Logs: `tail -f /var/log/messages | grep upguard`.
+
+> **Ressalva pfSense:** o script `/usr/local/etc/rc.d/upguard_agent.sh`, o binário
+> e o `/etc/upguard-agent/agent.env` **não sobrevivem a um upgrade de firmware**
+> do pfSense — reexecute o instalador após atualizar o pfSense.
 
 ## Configuração
 
