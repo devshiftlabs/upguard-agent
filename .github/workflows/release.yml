@@ -1,0 +1,51 @@
+name: Release
+
+# Roda ao dar push numa tag v* (ex.: git tag v1.3.0 && git push origin v1.3.0).
+# Cross-compila os binários e publica uma GitHub Release com eles anexados —
+# é de lá que o install.sh/self-update baixam (releases/latest/download/...).
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # necessário para criar a Release e anexar os binários
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Extrai a versão da tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-compile (linux/darwin/windows/freebsd — amd64+arm64)
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 freebsd/amd64 freebsd/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            ext=''; [ "$os" = windows ] && ext='.exe'
+            echo "building $os/$arch"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/upguard-agent-${os}-${arch}${ext}" .
+          done
+          ls -la dist/
+
+      - name: Publica a GitHub Release + binários
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/upguard-agent-*
+          generate_release_notes: true
