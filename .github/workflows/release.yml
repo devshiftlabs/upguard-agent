@@ -13,7 +13,8 @@ permissions:
 
 jobs:
   build-release:
-    runs-on: ubuntu-latest
+    # Build agents self-hosted do cluster (mesmos labels usados pelo frontend).
+    runs-on: [self-hosted, linux, docker]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
