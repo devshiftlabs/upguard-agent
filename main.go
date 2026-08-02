@@ -74,6 +74,7 @@ type metrics struct {
 	MemUsed     uint64  `json:"mem_used_bytes"`
 	DiskPercent float64 `json:"disk_percent"`
 	DiskUsed    uint64  `json:"disk_used_bytes"`
+	DiskTotal   uint64  `json:"disk_total_bytes"`
 	Load1       float64 `json:"load1"`
 	Load5       float64 `json:"load5"`
 	Load15      float64 `json:"load15"`
@@ -412,6 +413,7 @@ func collect(cfg config, client *http.Client, paused bool) payload {
 	if du, err := disk.Usage(rootPath()); err == nil {
 		m.DiskPercent = round2(du.UsedPercent)
 		m.DiskUsed = du.Used
+		m.DiskTotal = du.Total
 	}
 	if la, err := load.Avg(); err == nil {
 		m.Load1 = round2(la.Load1)
