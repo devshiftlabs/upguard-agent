@@ -13,8 +13,10 @@ permissions:
 
 jobs:
   build-release:
-    # Build agents self-hosted do cluster (mesmos labels usados pelo frontend).
-    runs-on: [self-hosted, linux, docker]
+    # Runner hospedado pelo GitHub: os self-hosted da org não pegam job de repo
+    # público (allows_public_repositories=false no runner group), e este job
+    # não precisa de docker/segredo nenhum — só toolchain Go pra cross-compile.
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
