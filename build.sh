@@ -7,7 +7,9 @@ cd "$(dirname "$0")"
 mkdir -p dist
 
 DOCKER="${DOCKER:-docker}"
-"$DOCKER" run --rm -v "$PWD":/src -w /src golang:1.22-alpine sh -c "
+# Mesma versão do go.mod (diretiva go) — atualize os dois juntos.
+GO_IMAGE="${GO_IMAGE:-golang:1.27.3-alpine}"
+"$DOCKER" run --rm -v "$PWD":/src -w /src "$GO_IMAGE" sh -c "
   set -e
   apk add --no-cache git >/dev/null
   go mod tidy
