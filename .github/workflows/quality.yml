@@ -1,0 +1,113 @@
+name: Qualidade
+
+# Testes + cobertura + govulncheck em todo PR/push na main; análise do
+# SonarQube (self-hosted, só na rede interna) quando SONAR_TOKEN e
+# SONAR_HOST_URL estiverem configurados — sem eles o job é pulado.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Testes, cobertura e govulncheck
+    # Runner hospedado pelo GitHub: o repo é público e os self-hosted da org
+    # não pegam job de repo público (mesmo motivo do release.yml).
+    runs-on: ubuntu-latest
+    outputs:
+      sonar: ${{ steps.sonar.outputs.enabled }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Testes (race + cobertura)
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Cobertura total
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: Guarda o coverprofile para o Sonar
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+      - name: Sonar configurado?
+        id: sonar
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || vars.SONAR_HOST_URL }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_HOST_URL" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SONAR_TOKEN/SONAR_HOST_URL não configurados — análise do SonarQube pulada"
+          fi
+
+  sonar:
+    name: SonarQube
+    needs: test
+    if: needs.test.outputs.sonar == 'true'
+    # O SonarQube só é acessível pela rede interna. Para este job rodar, o
+    # runner group dos self-hosted precisa aceitar repositórios públicos.
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Reset ownership do workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}":/w alpine:3 \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Histórico completo para o blame do SonarQube (atribuição de new code).
+          fetch-depth: 0
+
+      - name: Baixa o coverprofile
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage
+
+      - name: SonarQube Scan
+        # Mesmo esquema dos outros repos: a imagem oficial do scanner exige
+        # x86-64-v2 (a CPU do runner não suporta); roda o binário num temurin.
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || vars.SONAR_HOST_URL }}
+        run: |
+          docker run --rm \
+            --network host \
+            -e SONAR_HOST_URL -e SONAR_TOKEN \
+            -v "$PWD":/src -w /src \
+            eclipse-temurin:17-jdk-jammy bash -c '
+              set -e
+              apt-get update -qq && apt-get install -y -qq unzip curl >/dev/null
+              curl -sSLo /tmp/s.zip "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.1.4610-linux-x64.zip"
+              unzip -q /tmp/s.zip -d /opt
+              DIR=$(find /opt -maxdepth 1 -type d -name "sonar-scanner-*" | head -1)
+              "$DIR/bin/sonar-scanner" -Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300
+            '
+
+      - name: Reset ownership (evita quebrar outros workflows no runner)
+        if: always()
+        run: |
+          docker run --rm -v "${{ github.workspace }}":/w alpine:3 \
+            chown -R "$(id -u):$(id -g)" /w || true

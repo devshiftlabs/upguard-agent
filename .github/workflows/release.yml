@@ -27,6 +27,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Testes (vet + race)
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: govulncheck (bloqueia release com vulnerabilidade alcançável)
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
       - name: Extrai a versão da tag
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"

@@ -7,30 +7,29 @@ package main
 // do banco nunca saem da memória do processo.
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/microsoft/go-mssqldb"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
-const checkTimeout = 10 * time.Second
+const (
+	checkTimeout = 10 * time.Second
+	// minCheckInterval: abaixo disso o check roda a cada defaultCheckInterval.
+	minCheckInterval     = 15 * time.Second
+	defaultCheckInterval = 60 * time.Second
+	maxDetailDatabases   = 50
+	maxErrLen            = 300
+)
 
 type agentCheck struct {
 	ID              string `json:"id"`
@@ -42,6 +41,11 @@ type agentCheck struct {
 	Username        string `json:"username"`
 	Password        string `json:"password"`
 	IntervalSeconds int    `json:"interval_seconds"`
+}
+
+// addr é host:port do alvo (IPv6 entre colchetes).
+func (c agentCheck) addr() string {
+	return net.JoinHostPort(c.TargetHost, fmt.Sprint(c.TargetPort))
 }
 
 type checkResult struct {
@@ -77,12 +81,13 @@ func finishDetails(d *checkDetails) *checkDetails {
 		}
 		d.TotalSizeBytes = total
 	}
-	if len(d.Databases) > 50 {
-		d.Databases = d.Databases[:50]
+	if len(d.Databases) > maxDetailDatabases {
+		d.Databases = d.Databases[:maxDetailDatabases]
 	}
 	return d
 }
 
+// sortDBs ordena por tamanho decrescente (insertion sort estável).
 func sortDBs(dbs []dbEntry) {
 	for i := 1; i < len(dbs); i++ {
 		for j := i; j > 0 && dbs[j].SizeBytes > dbs[j-1].SizeBytes; j-- {
@@ -93,27 +98,10 @@ func sortDBs(dbs []dbEntry) {
 
 // fetchChecks puxa os checks habilitados deste host.
 func fetchChecks(cfg config, client *http.Client, hostID string) ([]agentCheck, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		cfg.server+"/api/agent/checks?host_id="+url.QueryEscape(hostID), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.SetBasicAuth(cfg.clientID, cfg.clientSecret)
-	req.Header.Set("User-Agent", userAgent)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("servidor respondeu %d", resp.StatusCode)
-	}
 	var out struct {
 		Checks []agentCheck `json:"checks"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := apiCall(cfg, client, http.MethodGet, "/api/agent/checks?host_id="+url.QueryEscape(hostID), nil, &out, true); err != nil {
 		return nil, err
 	}
 	return out.Checks, nil
@@ -125,42 +113,13 @@ func sendCheckResults(cfg config, client *http.Client, hostID string, results []
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		cfg.server+"/api/agent/checks/results", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", userAgent)
-	req.SetBasicAuth(cfg.clientID, cfg.clientSecret)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("servidor respondeu %d", resp.StatusCode)
-	}
-	return nil
-}
-
-// runCheck executa um check e mede a latência.
-func runCheck(c agentCheck) checkResult {
-	start := time.Now()
-	details, err := probeTarget(c)
-	lat := time.Since(start).Milliseconds()
-	if err != nil {
-		return checkResult{CheckID: c.ID, OK: false, LatencyMs: lat, Error: trimErr(err)}
-	}
-	return checkResult{CheckID: c.ID, OK: true, LatencyMs: lat, Details: details}
+	return apiCall(cfg, client, http.MethodPost, "/api/agent/checks/results", body, nil, false)
 }
 
 func trimErr(err error) string {
 	s := err.Error()
-	if len(s) > 300 {
-		s = s[:300]
+	if len(s) > maxErrLen {
+		s = s[:maxErrLen]
 	}
 	return s
 }
@@ -183,42 +142,67 @@ const (
 	              GROUP BY d.name`
 )
 
-func probeTarget(c agentCheck) (*checkDetails, error) {
+func postgresDSN(c agentCheck) string {
+	db := c.DatabaseName
+	if db == "" {
+		db = "postgres"
+	}
+	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=prefer&connect_timeout=10",
+		url.QueryEscape(c.Username), url.QueryEscape(c.Password), c.addr(), url.PathEscape(db))
+}
+
+func mysqlDSN(c agentCheck) string {
+	return fmt.Sprintf("%s:%s@tcp(%s)/%s?timeout=10s&readTimeout=10s&tls=preferred",
+		c.Username, c.Password, c.addr(), c.DatabaseName)
+}
+
+func sqlserverDSN(c agentCheck) string {
+	q := url.Values{}
+	if c.DatabaseName != "" {
+		q.Set("database", c.DatabaseName)
+	}
+	q.Set("dial timeout", "10")
+	u := &url.URL{
+		Scheme:   "sqlserver",
+		User:     url.UserPassword(c.Username, c.Password),
+		Host:     c.addr(),
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+type dialFunc func(network, address string, timeout time.Duration) (net.Conn, error)
+
+// prober executa um check conforme o tipo. Os campos são as conexões reais
+// (database/sql, driver do Mongo, TCP) e são trocados por fakes nos testes.
+type prober struct {
+	sql   func(driver, dsn, versionQ, dbsQ string) (*checkDetails, error)
+	mongo func(uri string) (*checkDetails, error)
+	dial  dialFunc
+}
+
+func defaultProber() prober {
+	return prober{
+		sql:   sqlProbe,
+		mongo: func(uri string) (*checkDetails, error) { return mongoProbe(connectMongo, uri) },
+		dial:  net.DialTimeout,
+	}
+}
+
+func (p prober) probe(c agentCheck) (*checkDetails, error) {
 	switch c.Type {
 	case "postgres":
-		db := c.DatabaseName
-		if db == "" {
-			db = "postgres"
-		}
-		dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=prefer&connect_timeout=10",
-			url.QueryEscape(c.Username), url.QueryEscape(c.Password),
-			net.JoinHostPort(c.TargetHost, fmt.Sprint(c.TargetPort)), url.PathEscape(db))
-		return sqlProbe("pgx", dsn, pgVersionQ, pgDBsQ)
+		return p.sql("pgx", postgresDSN(c), pgVersionQ, pgDBsQ)
 	case "mysql":
-		dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?timeout=10s&readTimeout=10s&tls=preferred",
-			c.Username, c.Password,
-			net.JoinHostPort(c.TargetHost, fmt.Sprint(c.TargetPort)), c.DatabaseName)
-		return sqlProbe("mysql", dsn, myVersionQ, myDBsQ)
+		return p.sql("mysql", mysqlDSN(c), myVersionQ, myDBsQ)
 	case "sqlserver":
-		q := url.Values{}
-		if c.DatabaseName != "" {
-			q.Set("database", c.DatabaseName)
-		}
-		q.Set("dial timeout", "10")
-		u := &url.URL{
-			Scheme:   "sqlserver",
-			User:     url.UserPassword(c.Username, c.Password),
-			Host:     net.JoinHostPort(c.TargetHost, fmt.Sprint(c.TargetPort)),
-			RawQuery: q.Encode(),
-		}
-		return sqlProbe("sqlserver", u.String(), msVersionQ, msDBsQ)
+		return p.sql("sqlserver", sqlserverDSN(c), msVersionQ, msDBsQ)
 	case "mongodb":
-		return mongoProbe(c)
+		return p.mongo(mongoURI(c))
 	case "redis":
-		return redisProbe(c)
-	case "tcp":
-		conn, err := net.DialTimeout("tcp",
-			net.JoinHostPort(c.TargetHost, fmt.Sprint(c.TargetPort)), checkTimeout)
+		return redisProbe(p.dial, c)
+	case networkTCP:
+		conn, err := p.dial(networkTCP, c.addr(), checkTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -244,158 +228,81 @@ func sqlProbe(driver, dsn, versionQ, dbsQ string) (*checkDetails, error) {
 	}
 	d := &checkDetails{}
 	_ = db.QueryRowContext(ctx, versionQ).Scan(&d.Version)
-	if rows, err := db.QueryContext(ctx, dbsQ); err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var e dbEntry
-			var size sql.NullInt64
-			if rows.Scan(&e.Name, &size) == nil {
-				if size.Valid {
-					e.SizeBytes = size.Int64
-				}
-				d.Databases = append(d.Databases, e)
+	d.Databases = queryDatabases(ctx, db, dbsQ)
+	return finishDetails(d), nil
+}
+
+// queryDatabases lê (nome, tamanho) de cada banco; linhas inválidas são puladas
+// e tamanho NULL vira 0.
+func queryDatabases(ctx context.Context, db *sql.DB, dbsQ string) []dbEntry {
+	rows, err := db.QueryContext(ctx, dbsQ)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []dbEntry
+	for rows.Next() {
+		var e dbEntry
+		var size sql.NullInt64
+		if rows.Scan(&e.Name, &size) == nil {
+			if size.Valid {
+				e.SizeBytes = size.Int64
 			}
+			out = append(out, e)
 		}
 	}
-	return finishDetails(d), nil
-}
-
-func mongoProbe(c agentCheck) (*checkDetails, error) {
-	u := &url.URL{Scheme: "mongodb", Host: net.JoinHostPort(c.TargetHost, fmt.Sprint(c.TargetPort))}
-	if c.Username != "" {
-		u.User = url.UserPassword(c.Username, c.Password)
-		q := url.Values{}
-		auth := c.DatabaseName
-		if auth == "" {
-			auth = "admin"
-		}
-		q.Set("authSource", auth)
-		u.RawQuery = q.Encode()
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), checkTimeout)
-	defer cancel()
-	client, err := mongo.Connect(ctx, options.Client().
-		ApplyURI(u.String()).
-		SetConnectTimeout(checkTimeout).
-		SetServerSelectionTimeout(checkTimeout))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = client.Disconnect(context.Background()) }()
-	if err := client.Ping(ctx, readpref.Primary()); err != nil {
-		return nil, err
-	}
-	d := &checkDetails{}
-	var bi struct {
-		Version string `bson:"version"`
-	}
-	_ = client.Database("admin").RunCommand(ctx, bson.D{{Key: "buildInfo", Value: 1}}).Decode(&bi)
-	d.Version = bi.Version
-	if res, err := client.ListDatabases(ctx, bson.D{}); err == nil {
-		for _, dbi := range res.Databases {
-			d.Databases = append(d.Databases, dbEntry{Name: dbi.Name, SizeBytes: dbi.SizeOnDisk})
-		}
-	}
-	return finishDetails(d), nil
-}
-
-// redisProbe fala RESP puro (sem dependência): AUTH opcional + PING + INFO
-// (versão, memória usada e keyspaces — best-effort).
-func redisProbe(c agentCheck) (*checkDetails, error) {
-	conn, err := net.DialTimeout("tcp",
-		net.JoinHostPort(c.TargetHost, fmt.Sprint(c.TargetPort)), checkTimeout)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(checkTimeout))
-	r := bufio.NewReader(conn)
-
-	// cmd envia um comando RESP e devolve a primeira linha da resposta; para
-	// respostas bulk ($N) lê também o corpo e o devolve.
-	cmd := func(parts ...string) (string, string, error) {
-		var b strings.Builder
-		fmt.Fprintf(&b, "*%d\r\n", len(parts))
-		for _, p := range parts {
-			fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(p), p)
-		}
-		if _, err := conn.Write([]byte(b.String())); err != nil {
-			return "", "", err
-		}
-		line, err := r.ReadString('\n')
-		if err != nil {
-			return "", "", err
-		}
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "$") && line != "$-1" {
-			var n int
-			if _, err := fmt.Sscanf(line, "$%d", &n); err == nil && n >= 0 {
-				body := make([]byte, n+2) // payload + \r\n
-				if _, err := io.ReadFull(r, body); err != nil {
-					return line, "", err
-				}
-				return line, string(body[:n]), nil
-			}
-		}
-		return line, "", nil
-	}
-
-	if c.Password != "" {
-		var reply string
-		if c.Username != "" {
-			reply, _, err = cmd("AUTH", c.Username, c.Password)
-		} else {
-			reply, _, err = cmd("AUTH", c.Password)
-		}
-		if err != nil {
-			return nil, err
-		}
-		if strings.HasPrefix(reply, "-") {
-			return nil, fmt.Errorf("redis: %s", strings.TrimPrefix(reply, "-"))
-		}
-	}
-	reply, _, err := cmd("PING")
-	if err != nil {
-		return nil, err
-	}
-	if reply != "+PONG" {
-		return nil, fmt.Errorf("redis: resposta inesperada %q", reply)
-	}
-
-	d := &checkDetails{}
-	if _, info, err := cmd("INFO"); err == nil && info != "" {
-		parseRedisInfo(info, d)
-	}
-	return finishDetails(d), nil
-}
-
-// parseRedisInfo extrai versão, memória usada e keyspaces do INFO.
-func parseRedisInfo(info string, d *checkDetails) {
-	for _, line := range strings.Split(info, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "redis_version:"):
-			d.Version = strings.TrimPrefix(line, "redis_version:")
-		case strings.HasPrefix(line, "used_memory:"):
-			fmt.Sscanf(strings.TrimPrefix(line, "used_memory:"), "%d", &d.TotalSizeBytes)
-		case strings.HasPrefix(line, "db") && strings.Contains(line, ":keys="):
-			name, rest, _ := strings.Cut(line, ":")
-			var keys int64
-			fmt.Sscanf(rest, "keys=%d", &keys)
-			d.Databases = append(d.Databases, dbEntry{
-				Name: fmt.Sprintf("%s (%d chaves)", name, keys),
-			})
-		}
-	}
+	return out
 }
 
 // checkRunner mantém o agendamento por check (respeita interval_seconds).
 type checkRunner struct {
 	lastRun map[string]time.Time
+	now     func() time.Time
+	probe   func(agentCheck) (*checkDetails, error)
 }
 
 func newCheckRunner() *checkRunner {
-	return &checkRunner{lastRun: map[string]time.Time{}}
+	return &checkRunner{lastRun: map[string]time.Time{}, now: time.Now, probe: defaultProber().probe}
+}
+
+// runCheck executa um check e mede a latência.
+func (cr *checkRunner) runCheck(c agentCheck) checkResult {
+	start := time.Now()
+	details, err := cr.probe(c)
+	lat := time.Since(start).Milliseconds()
+	if err != nil {
+		return checkResult{CheckID: c.ID, OK: false, LatencyMs: lat, Error: trimErr(err)}
+	}
+	return checkResult{CheckID: c.ID, OK: true, LatencyMs: lat, Details: details}
+}
+
+// checkInterval é o intervalo efetivo do check (mínimo 15s; abaixo, 60s).
+func checkInterval(c agentCheck) time.Duration {
+	iv := time.Duration(c.IntervalSeconds) * time.Second
+	if iv < minCheckInterval {
+		return defaultCheckInterval
+	}
+	return iv
+}
+
+// runDue executa os checks cujo intervalo já venceu.
+func (cr *checkRunner) runDue(checks []agentCheck) []checkResult {
+	var results []checkResult
+	now := cr.now()
+	for _, c := range checks {
+		if last, ok := cr.lastRun[c.ID]; ok && now.Sub(last) < checkInterval(c) {
+			continue
+		}
+		cr.lastRun[c.ID] = now
+		res := cr.runCheck(c)
+		results = append(results, res)
+		if res.OK {
+			log.Printf("check %q (%s %s:%d): ok em %dms", c.Name, c.Type, c.TargetHost, c.TargetPort, res.LatencyMs)
+		} else {
+			log.Printf("check %q (%s %s:%d): FALHOU: %s", c.Name, c.Type, c.TargetHost, c.TargetPort, res.Error)
+		}
+	}
+	return results
 }
 
 // cycle puxa os checks e executa os que estão no vencimento.
@@ -408,31 +315,11 @@ func (cr *checkRunner) cycle(cfg config, client *http.Client, hostID string) {
 		log.Printf("checks: erro ao buscar: %v", err)
 		return
 	}
-	if len(checks) == 0 {
+	results := cr.runDue(checks)
+	if len(results) == 0 {
 		return
 	}
-	var results []checkResult
-	now := time.Now()
-	for _, c := range checks {
-		iv := time.Duration(c.IntervalSeconds) * time.Second
-		if iv < 15*time.Second {
-			iv = 60 * time.Second
-		}
-		if last, ok := cr.lastRun[c.ID]; ok && now.Sub(last) < iv {
-			continue
-		}
-		cr.lastRun[c.ID] = now
-		res := runCheck(c)
-		results = append(results, res)
-		if res.OK {
-			log.Printf("check %q (%s %s:%d): ok em %dms", c.Name, c.Type, c.TargetHost, c.TargetPort, res.LatencyMs)
-		} else {
-			log.Printf("check %q (%s %s:%d): FALHOU: %s", c.Name, c.Type, c.TargetHost, c.TargetPort, res.Error)
-		}
-	}
-	if len(results) > 0 {
-		if err := sendCheckResults(cfg, client, hostID, results); err != nil {
-			log.Printf("checks: erro ao enviar resultados: %v", err)
-		}
+	if err := sendCheckResults(cfg, client, hostID, results); err != nil {
+		log.Printf("checks: erro ao enviar resultados: %v", err)
 	}
 }

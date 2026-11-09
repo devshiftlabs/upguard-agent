@@ -57,6 +57,21 @@ Cross-compila para todos os alvos usando Docker (sem Go local):
 ```sh
 ./build.sh 1.0.0      # gera dist/upguard-agent-<os>-<arch>[.exe]
 ```
+A imagem do build (`golang:1.27.3-alpine`) acompanha a diretiva `go` do `go.mod`
+— atualize as duas juntas.
+
+## Testes e qualidade
+
+```sh
+go vet ./...
+go test -race -coverprofile=coverage.out ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+```
+As fontes do sistema (gopsutil, comandos do SO, rede, drivers de banco) ficam
+atrás de funções injetáveis, e os testes usam fakes/servidores locais
+(`httptest`, RESP falso, driver `database/sql` em memória). O workflow
+`Qualidade` roda isso em todo PR e, com `SONAR_TOKEN`/`SONAR_HOST_URL`
+configurados, envia a análise ao SonarQube (`sonar-project.properties`).
 
 ## Protocolo
 
