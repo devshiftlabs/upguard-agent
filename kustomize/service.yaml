@@ -1,0 +1,17 @@
+# Só dentro do cluster: o acesso público é pelo nginx do frontend
+# (https://upguard.com.br/downloads/agent/ -> este serviço).
+apiVersion: v1
+kind: Service
+metadata:
+  name: upguard-agent-downloads
+  namespace: upguard
+  labels:
+    app: upguard-agent-downloads
+spec:
+  type: ClusterIP
+  selector:
+    app: upguard-agent-downloads
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

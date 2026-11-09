@@ -83,7 +83,7 @@ func newAgent(cfg config) *agent {
 		client: client,
 		sys:    defaultSysSource(),
 		inv:    newSWInventory(cfg, client),
-		upd:    newUpdater(client),
+		upd:    newUpdater(client, cfg.updateURL),
 		checks: newCheckRunner(),
 		state:  loopState{current: cfg.interval},
 		now:    time.Now,
@@ -118,7 +118,7 @@ func (a *agent) tick() time.Duration {
 
 // run executa ciclos até ctx ser cancelado; o primeiro é imediato.
 func (a *agent) run(ctx context.Context) {
-	log.Printf("upguard-agent %s iniciando — servidor=%s intervalo(inicial)=%s", version, a.cfg.server, a.cfg.interval)
+	log.Printf("upguard-agent %s iniciando — servidor=%s intervalo(inicial)=%s auto-update=%s", version, a.cfg.server, a.cfg.interval, a.cfg.updateURL)
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {

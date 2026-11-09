@@ -1,0 +1,21 @@
+# Aplicar uma vez no k3s-prd: kubectl apply -f argocd-application.yaml
+# Com o repositório privado o ArgoCD precisa de uma deploy key só-leitura
+# (secret repo-upguard-agent no ns argocd), igual aos outros repos.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: upguard-agent-downloads
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:devshiftlabs/upguard-agent.git
+    targetRevision: main
+    path: kustomize
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: upguard
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

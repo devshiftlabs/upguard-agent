@@ -22,37 +22,37 @@ func TestParseConfig(t *testing.T) {
 	}{
 		{
 			name: "defaults",
-			want: config{server: defaultServer, interval: 60 * time.Second},
+			want: config{server: defaultServer, interval: 60 * time.Second, updateURL: defaultUpdateURL},
 		},
 		{
 			name: "env",
 			env: map[string]string{
 				"UPGUARD_CLIENT_ID": "agt_1", "UPGUARD_CLIENT_SECRET": "sk_1",
 				"UPGUARD_SERVER_URL": "https://x.example", "UPGUARD_HOSTNAME": "srv1",
-				"UPGUARD_INTERVAL": "120",
+				"UPGUARD_INTERVAL": "120", "UPGUARD_UPDATE_URL": "https://mirror.example/agent",
 			},
-			want: config{"agt_1", "sk_1", "https://x.example", "srv1", 120 * time.Second},
+			want: config{"agt_1", "sk_1", "https://x.example", "srv1", 120 * time.Second, "https://mirror.example/agent"},
 		},
 		{
 			name: "flags ganham do env",
-			args: []string{"--client-id", "a", "--client-secret", "s", "--server", "https://f", "--hostname", "h", "--interval", "30"},
-			env:  map[string]string{"UPGUARD_CLIENT_ID": "env", "UPGUARD_INTERVAL": "300"},
-			want: config{"a", "s", "https://f", "h", 30 * time.Second},
+			args: []string{"--client-id", "a", "--client-secret", "s", "--server", "https://f", "--hostname", "h", "--interval", "30", "--update-url", "off"},
+			env:  map[string]string{"UPGUARD_CLIENT_ID": "env", "UPGUARD_INTERVAL": "300", "UPGUARD_UPDATE_URL": "https://env"},
+			want: config{"a", "s", "https://f", "h", 30 * time.Second, "off"},
 		},
 		{
 			name: "intervalo abaixo do mínimo sobe para 10s",
 			args: []string{"--interval", "3"},
-			want: config{server: defaultServer, interval: 10 * time.Second},
+			want: config{server: defaultServer, interval: 10 * time.Second, updateURL: defaultUpdateURL},
 		},
 		{
 			name: "env de intervalo abaixo do mínimo",
 			env:  map[string]string{"UPGUARD_INTERVAL": "5"},
-			want: config{server: defaultServer, interval: 10 * time.Second},
+			want: config{server: defaultServer, interval: 10 * time.Second, updateURL: defaultUpdateURL},
 		},
 		{
 			name: "env de intervalo inválido mantém o default",
 			env:  map[string]string{"UPGUARD_INTERVAL": "abc"},
-			want: config{server: defaultServer, interval: 60 * time.Second},
+			want: config{server: defaultServer, interval: 60 * time.Second, updateURL: defaultUpdateURL},
 		},
 	}
 	for _, tt := range tests {
