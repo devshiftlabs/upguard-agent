@@ -72,6 +72,7 @@ type agent struct {
 	checks          *checkRunner
 	state           loopState
 	hostID          string
+	auth            authBackoff
 	lastUpdateCheck time.Time
 	now             func() time.Time
 }
@@ -101,9 +102,13 @@ func (a *agent) tick() time.Duration {
 	p := collect(a.cfg, a.sys, a.inv.get(), a.state.paused)
 	sc, err := send(a.cfg, a.client, p)
 	if err != nil {
+		if code, rejected := authRejection(err); rejected {
+			return a.onAuthRejected(code)
+		}
 		log.Printf("erro ao enviar métricas: %v", err)
 		return a.state.nextDelay()
 	}
+	a.onAuthAccepted()
 	logSent(p)
 	if sc.hostID != "" {
 		a.hostID = sc.hostID
