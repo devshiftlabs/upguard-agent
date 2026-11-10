@@ -1,0 +1,67 @@
+# Endereço de download do agente (binários + manifesto + instaladores).
+# A tag é trocada pelo release.yml (job publish-downloads) ou por
+# scripts/publish-downloads.sh --kustomize; o ArgoCD (app
+# upguard-agent-downloads) aplica. Rollback = voltar a tag.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upguard-agent-downloads
+  namespace: upguard
+  labels:
+    app: upguard-agent-downloads
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: upguard-agent-downloads
+  template:
+    metadata:
+      labels:
+        app: upguard-agent-downloads
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: downloads
+          image: harbor.shiftcloud.corp/upguard/agent-downloads:1.8.0
+          ports:
+            - containerPort: 8080
+              name: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "10m"
+            limits:
+              memory: "64Mi"
+              cpu: "200m"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          volumeMounts:
+            # nginx-unprivileged grava pid e temporários em /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

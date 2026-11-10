@@ -72,6 +72,7 @@ type agent struct {
 	checks          *checkRunner
 	state           loopState
 	hostID          string
+	auth            authBackoff
 	lastUpdateCheck time.Time
 	now             func() time.Time
 }
@@ -83,7 +84,7 @@ func newAgent(cfg config) *agent {
 		client: client,
 		sys:    defaultSysSource(),
 		inv:    newSWInventory(cfg, client),
-		upd:    newUpdater(client),
+		upd:    newUpdater(client, cfg.updateURL),
 		checks: newCheckRunner(),
 		state:  loopState{current: cfg.interval},
 		now:    time.Now,
@@ -101,9 +102,13 @@ func (a *agent) tick() time.Duration {
 	p := collect(a.cfg, a.sys, a.inv.get(), a.state.paused)
 	sc, err := send(a.cfg, a.client, p)
 	if err != nil {
+		if code, rejected := authRejection(err); rejected {
+			return a.onAuthRejected(code)
+		}
 		log.Printf("erro ao enviar métricas: %v", err)
 		return a.state.nextDelay()
 	}
+	a.onAuthAccepted()
 	logSent(p)
 	if sc.hostID != "" {
 		a.hostID = sc.hostID
@@ -118,7 +123,7 @@ func (a *agent) tick() time.Duration {
 
 // run executa ciclos até ctx ser cancelado; o primeiro é imediato.
 func (a *agent) run(ctx context.Context) {
-	log.Printf("upguard-agent %s iniciando — servidor=%s intervalo(inicial)=%s", version, a.cfg.server, a.cfg.interval)
+	log.Printf("upguard-agent %s iniciando — servidor=%s intervalo(inicial)=%s auto-update=%s", version, a.cfg.server, a.cfg.interval, a.cfg.updateURL)
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {

@@ -2,9 +2,10 @@
 # Instalador do UpGuard Agent para Linux, macOS e FreeBSD/pfSense.
 # POSIX sh (sem bashismos) — roda em bash, dash e no /bin/sh do FreeBSD/pfSense.
 # Uso:
-#   curl -sSL https://.../install.sh | sudo sh -s -- \
+#   curl -sSL https://upguard.com.br/downloads/agent/install.sh | sudo sh -s -- \
 #        --client-id agt_xxx --client-secret sk_agt_xxx
-#   # No pfSense (já é root, e pode não ter curl): fetch -o- https://.../install.sh | \
+#   # No pfSense (já é root, e pode não ter curl):
+#   #   fetch -o- https://upguard.com.br/downloads/agent/install.sh | \
 #   #   sh -s -- --client-id agt_xxx --client-secret sk_agt_xxx
 #
 # Flags:
@@ -12,14 +13,20 @@
 #   --client-secret   (obrigatório)
 #   --server URL      (default https://api.upguard.com.br)
 #   --interval SEG    (default 60)
-#   --base-url URL    (onde baixar o binário; default releases do GitHub)
+#   --base-url URL    (onde baixar o binário e o SHA256SUMS; default
+#                      https://upguard.com.br/downloads/agent/latest)
+#   --update-url URL  (endereço do auto-update do agente; "off" desliga;
+#                      default o do próprio agente)
+#
+# O binário só é instalado se o SHA-256 conferir com o SHA256SUMS publicado.
 set -eu
 
 CLIENT_ID=""
 CLIENT_SECRET=""
 SERVER="https://api.upguard.com.br"
 INTERVAL="60"
-BASE_URL="https://github.com/devshiftlabs/upguard-agent/releases/latest/download"
+BASE_URL="https://upguard.com.br/downloads/agent/latest"
+UPDATE_URL=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -28,6 +35,7 @@ while [ $# -gt 0 ]; do
     --server) SERVER="$2"; shift 2;;
     --interval) INTERVAL="$2"; shift 2;;
     --base-url) BASE_URL="$2"; shift 2;;
+    --update-url) UPDATE_URL="$2"; shift 2;;
     *) echo "flag desconhecida: $1"; exit 1;;
   esac
 done
@@ -43,7 +51,8 @@ case "$ARCH" in
   *) echo "arquitetura não suportada: $ARCH"; exit 1;;
 esac
 
-BIN_URL="$BASE_URL/upguard-agent-${OS}-${ARCH}"
+BIN_NAME="upguard-agent-${OS}-${ARCH}"
+BIN_URL="$BASE_URL/$BIN_NAME"
 BIN_PATH="/usr/local/bin/upguard-agent"
 
 # download URL -> arquivo. Usa curl se existir, senão fetch (padrão no FreeBSD).
@@ -57,11 +66,33 @@ download() {
   fi
 }
 
+# sha256_of ARQUIVO -> hash em hexadecimal (sha256sum no Linux, shasum no
+# macOS, sha256 no FreeBSD, openssl como último recurso).
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256 >/dev/null 2>&1; then sha256 -q "$1"
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
+
 echo "Baixando $BIN_URL ..."
 # Baixa para um temp e move (rename atômico) — evita "Text file busy" (ETXTBSY)
 # quando o binário já está em execução (update do agente).
 TMP_BIN="$(mktemp)"
+TMP_SUMS="$(mktemp)"
+trap 'rm -f "$TMP_BIN" "$TMP_SUMS"' EXIT
+download "$BASE_URL/SHA256SUMS" "$TMP_SUMS"
 download "$BIN_URL" "$TMP_BIN"
+EXPECTED="$(awk -v f="$BIN_NAME" '$2 == f || $2 == "*" f {print $1}' "$TMP_SUMS" | head -n 1)"
+GOT="$(sha256_of "$TMP_BIN")"
+[ -n "$EXPECTED" ] || { echo "erro: $BIN_NAME não está no SHA256SUMS publicado"; exit 1; }
+[ -n "$GOT" ] || { echo "erro: nenhuma ferramenta de SHA-256 (sha256sum/shasum/sha256/openssl) disponível"; exit 1; }
+if [ "$GOT" != "$EXPECTED" ]; then
+  echo "erro: SHA-256 do binário não confere (recebido $GOT, esperado $EXPECTED) — nada foi instalado"
+  exit 1
+fi
+echo "SHA-256 conferido: $GOT"
 chmod +x "$TMP_BIN"
 mv -f "$TMP_BIN" "$BIN_PATH"
 
@@ -73,6 +104,7 @@ UPGUARD_CLIENT_SECRET=$CLIENT_SECRET
 UPGUARD_SERVER_URL=$SERVER
 UPGUARD_INTERVAL=$INTERVAL
 EOF
+[ -z "$UPDATE_URL" ] || echo "UPGUARD_UPDATE_URL=$UPDATE_URL" >> /etc/upguard-agent/agent.env
 chmod 600 /etc/upguard-agent/agent.env
 
 case "$OS" in
@@ -102,6 +134,8 @@ EOF
 darwin)
   # macOS: launchd
   PLIST=/Library/LaunchDaemons/br.com.shiftlabs.upguard-agent.plist
+  UPDATE_XML=""
+  [ -z "$UPDATE_URL" ] || UPDATE_XML="<key>UPGUARD_UPDATE_URL</key><string>$UPDATE_URL</string>"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -113,6 +147,7 @@ darwin)
     <key>UPGUARD_CLIENT_SECRET</key><string>$CLIENT_SECRET</string>
     <key>UPGUARD_SERVER_URL</key><string>$SERVER</string>
     <key>UPGUARD_INTERVAL</key><string>$INTERVAL</string>
+    $UPDATE_XML
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

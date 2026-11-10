@@ -1,22 +1,37 @@
 name: Release
 
-# Roda ao dar push numa tag v* (ex.: git tag v1.3.0 && git push origin v1.3.0).
-# Cross-compila os binários e publica uma GitHub Release com eles anexados —
-# é de lá que o install.sh/self-update baixam (releases/latest/download/...).
+# Roda ao dar push numa tag v* (ex.: git tag v1.8.0 && git push origin v1.8.0).
+# Cross-compila os binários, monta a publicação do endereço de download próprio
+# (https://upguard.com.br/downloads/agent: latest.json assinado + SHA256SUMS +
+# binários + instaladores) e a publica numa imagem nginx no Harbor, que o
+# ArgoCD aplica no ns upguard. Ver docs/download-proprio.md.
+#
+# Transição: enquanto o repositório for PÚBLICO, os runners self-hosted não
+# pegam o job (allows_public_repositories=false) e o Harbor só é alcançável da
+# rede interna. Então, com o repo público: build no runner do GitHub + GitHub
+# Release (é dali que os agentes v1.7.0 ainda se atualizam) e a imagem é
+# publicada à mão no build-agent-1 com scripts/publish-downloads.sh
+# --from-release. Com o repo PRIVADO o job publish-downloads roda no
+# self-hosted (build-agent-1) sozinho e a GitHub Release deixa de ser criada.
 on:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write   # necessário para criar a Release e anexar os binários
+  contents: write   # GitHub Release (transição) e commit da tag no kustomize
+
+env:
+  REGISTRY: harbor.shiftcloud.corp
+  IMAGE: upguard/agent-downloads
 
 jobs:
-  build-release:
-    # Runner hospedado pelo GitHub: os self-hosted da org não pegam job de repo
-    # público (allows_public_repositories=false no runner group), e este job
-    # não precisa de docker/segredo nenhum — só toolchain Go pra cross-compile.
+  build:
+    # Runner do GitHub sempre (público ou privado): só precisa de Go para o
+    # cross-compile e dos segredos do repo; não precisa da rede interna.
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,6 +59,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
           set -euo pipefail
+          rm -rf dist build
           mkdir -p dist
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 freebsd/amd64 freebsd/arm64; do
             os="${target%/*}"; arch="${target#*/}"
@@ -55,8 +71,88 @@ jobs:
           done
           ls -la dist/
 
-      - name: Publica a GitHub Release + binários
+      # Assina o latest.json com AGENT_SIGNING_KEY (segredo do repositório).
+      # Se a chave pública estiver embutida no agente e o segredo faltar (ou
+      # for outro), o stage falha: a versão seria recusada por todos os agentes.
+      - name: Monta a publicação do endereço de download
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/upguard-release stage -version "$VERSION" -dist dist \
+            -out build/site/downloads/agent -extra scripts/install.sh -extra scripts/install.ps1
+          go run ./cmd/upguard-release verify -dir build/site/downloads/agent
+          tar -czf "dist/upguard-agent-downloads-${VERSION}.tar.gz" -C build/site downloads
+          cp build/site/downloads/agent/latest.json "build/site/downloads/agent/v${VERSION}/SHA256SUMS" dist/
+          if [ -f build/site/downloads/agent/latest.json.sig ]; then cp build/site/downloads/agent/latest.json.sig dist/; fi
+          ls -la dist/
+
+      # tar preserva o link latest/ (o upload-artifact não preserva links).
+      - name: Guarda a publicação
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloads
+          path: dist/upguard-agent-downloads-*.tar.gz
+          retention-days: 30
+
+      - name: GitHub Release (transição — só com o repositório público)
+        if: ${{ !github.event.repository.private }}
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/upguard-agent-*
+          files: |
+            dist/upguard-agent-*
+            dist/SHA256SUMS
+            dist/latest.json
+            dist/latest.json.sig
+          fail_on_unmatched_files: false
           generate_release_notes: true
+
+  publish-downloads:
+    needs: build
+    # Harbor e cluster só pela rede interna -> self-hosted, que só pega job
+    # de repositório privado. Com o repo público este job é pulado e a
+    # publicação é feita à mão (docs/download-proprio.md).
+    if: ${{ github.event.repository.private }}
+    runs-on: [self-hosted, linux, docker]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Baixa a publicação
+        uses: actions/download-artifact@v4
+        with:
+          name: downloads
+          path: pub
+
+      - name: Login no Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Imagem agent-downloads -> Harbor + tag no kustomize
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          scripts/publish-downloads.sh --version "$VERSION" \
+            --tarball "pub/upguard-agent-downloads-${VERSION}.tar.gz" --push --kustomize
+
+      - name: Commit da tag (o ArgoCD aplica)
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add kustomize/deployment.yaml
+          git diff --staged --quiet || git commit -m "Deploy agent-downloads v${VERSION} [skip ci]"
+          git push
