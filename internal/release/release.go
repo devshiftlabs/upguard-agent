@@ -42,7 +42,7 @@ const (
 // preenchida, o agente passa a EXIGIR a assinatura. Gere o par com
 // `go run ./cmd/upguard-release genkey`: a pública entra aqui (commit) e a
 // privada fica só no segredo AGENT_SIGNING_KEY do repositório.
-var PublicKeyB64 = ""
+var PublicKeyB64 = "HAXXiPAvlUpwxpIOwLY4BLgHZeRyfhQP7qs0pUoLYBA="
 
 // Targets são as plataformas publicadas — a mesma lista do build.sh e do release.yml.
 var Targets = []string{
